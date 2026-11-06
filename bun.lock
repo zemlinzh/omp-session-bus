@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "omp-local-agents",
+      "name": "omp-session-bus",
       "devDependencies": {
         "@types/bun": "^1.3.0",
         "typescript": "^5.9.0",

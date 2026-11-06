@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.1
+
+### Fixed
+
+- Withdraw reply-required notifications that were already answered through `session_list` / `session_reply`, stopped, failed, or invalidated by a session/project transition. They no longer remain as delayed actionable follow-ups after discussion completion ([#1](https://github.com/zemlinzh/omp-session-bus/issues/1)).
+- Revalidate asynchronous custom-message admission and prune restored stale queued objects without changing peer attribution or erasing delivered history.
+- Remove only owned pending/claimed objects with recovery-preserving queue pop/re-enqueue operations. Unrelated user input in either queue keeps its order and abort-restoration state.
+- Keep genuine unhandled messages and final-result processing automatic. Existing terminals must restart to replace their loaded 2.0.0 handlers.
+
 ## 2.0.0
 
 ### Breaking changes

@@ -207,6 +207,10 @@ export class ConversationBook {
     if (conversation) this.closeConversation(conversation);
   }
 
+  hasPendingMessage(messageId: string): boolean {
+    return this.pendingMessages.has(messageId);
+  }
+
   pending(): AgentMessage[] {
     // Callers may retain or alter display objects without changing correlation.
     return Array.from(this.pendingMessages.values(), message => ({ ...message }));

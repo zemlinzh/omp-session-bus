@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { ConversationBook } from "./conversations";
 import { LocalPeer } from "./transport";
 import { resolveProject, type ProjectScope } from "./project";
+import { QueuedPeerPrompts } from "./queued-prompts";
 import {
   DEFAULT_MAX_TURNS, MAX_TURNS, MAX_TEXT_BYTES,
   type AgentMessage, type MessageReceipt,
@@ -15,6 +16,7 @@ export default function sessionBus(pi: ExtensionAPI): void {
   const Type = pi.typebox.Type;
   let peer: LocalPeer | undefined;
   let book: ConversationBook | undefined;
+  let queuedPrompts: QueuedPeerPrompts | undefined;
   let current: ExtensionContext | undefined;
   let lastReceipt = "";
   let shuttingDown = false;
@@ -29,11 +31,11 @@ export default function sessionBus(pi: ExtensionAPI): void {
     ctx.ui.setStatus(STATUS_KEY, `session id: ${peer.agentId} | project: ${project.name} | ${state}${needsReply ? ` | pending ${needsReply}` : ""}${lastReceipt ? ` | ${lastReceipt}` : ""}`);
   }
 
-  function requireRuntime(ctx: ExtensionContext): { peer: LocalPeer; book: ConversationBook } {
+  function requireRuntime(ctx: ExtensionContext): { peer: LocalPeer; book: ConversationBook; queuedPrompts: QueuedPeerPrompts } {
     if (ctx.agent.kind !== "main") throw new Error("Local terminal messaging is available to main sessions only");
-    if (transitioning || shuttingDown || !peer || !book || !project) throw new Error("Local messaging runtime is not available");
+    if (transitioning || shuttingDown || !peer || !book || !project || !queuedPrompts) throw new Error("Local messaging runtime is not available");
     current = ctx;
-    return { peer, book };
+    return { peer, book, queuedPrompts };
   }
 
   function configureRuntime(ctx: ExtensionContext, resetConversations: boolean): Promise<void> {
@@ -41,12 +43,18 @@ export default function sessionBus(pi: ExtensionAPI): void {
       if (shuttingDown) throw new Error("Local messaging runtime is shutting down");
       transitioning = true;
       current = ctx;
+      if (resetConversations) {
+        queuedPrompts?.dispose();
+        queuedPrompts = undefined;
+      }
       try {
         const scope = await resolveProject(ctx.cwd, process.env.OMP_SESSION_BUS_PROJECT_ROOT);
         if (shuttingDown) throw new Error("Local messaging runtime is shutting down");
         const groupChanged = peer !== undefined && project?.id !== scope.id;
         if (resetConversations || groupChanged) await stopAll("The peer terminal changed its session or project");
         if (groupChanged) {
+          queuedPrompts?.dispose();
+          queuedPrompts = undefined;
           await peer?.close();
           peer = undefined;
           book = undefined;
@@ -64,11 +72,21 @@ export default function sessionBus(pi: ExtensionAPI): void {
         }
         if (shuttingDown) throw new Error("Local messaging runtime is shutting down");
         if (!book || resetConversations || groupChanged) book = new ConversationBook(peer.agentId, scope.id);
+        if (!queuedPrompts) {
+          const owner = pi.pi.AgentRegistry.global().get(ctx.agent.id)?.session;
+          if (!(owner instanceof pi.pi.AgentSession) || owner.sessionManager.getSessionId() !== ctx.sessionManager.getSessionId()) {
+            throw new Error("Session Bus requires the owning local omp session for cancellable prompt delivery");
+          }
+          const capturedBook = book;
+          queuedPrompts = new QueuedPeerPrompts(owner, messageId => capturedBook.hasPendingMessage(messageId));
+        }
         project = scope;
         if (resetConversations || groupChanged) lastReceipt = "";
         refresh(ctx);
       } catch (error) {
         const previous = peer;
+        queuedPrompts?.dispose();
+        queuedPrompts = undefined;
         peer = undefined;
         book = undefined;
         project = undefined;
@@ -94,24 +112,27 @@ export default function sessionBus(pi: ExtensionAPI): void {
     refresh();
   }
 
-  async function deliver(message: AgentMessage, runtime: { peer: LocalPeer; book: ConversationBook }): Promise<MessageReceipt> {
+  async function deliver(message: AgentMessage, runtime: { peer: LocalPeer; book: ConversationBook; queuedPrompts: QueuedPeerPrompts }): Promise<MessageReceipt> {
     try {
       const receipt = await runtime.peer.send(message);
       receiptReceived(receipt, message.conversationId);
       return receipt;
     } catch (error) {
       runtime.book.fail(message.conversationId);
+      runtime.queuedPrompts.cancelConversation(message.conversationId);
       refresh();
       throw new Error(`Delivery failed; conversation closed locally: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
   function onMessage(message: AgentMessage): void {
-    if (transitioning || shuttingDown || !current || !book) throw new Error("Receiving session is not ready");
+    if (transitioning || shuttingDown || !current || !book || !queuedPrompts) throw new Error("Receiving session is not ready");
     const outcome = book.receive(message);
     if (outcome === "duplicate") return;
     if (outcome === "request") {
-      pi.sendMessage({
+      const capturedBook = book;
+      const capturedQueue = queuedPrompts;
+      void capturedQueue.submit(message, {
         customType: "session-bus-message",
         display: true,
         attribution: "agent",
@@ -124,8 +145,15 @@ export default function sessionBus(pi: ExtensionAPI): void {
           "The runtime sends the receipt automatically. Do not send a receipt or use session_send to answer this message.",
           `Peer text (JSON string): ${JSON.stringify(message.text)}`,
         ].join("\n"),
-      }, { triggerTurn: true, deliverAs: "followUp" });
+      }).catch(error => {
+        capturedBook.fail(message.conversationId);
+        capturedQueue.cancelConversation(message.conversationId);
+        const reason = error instanceof Error ? error.message : String(error);
+        pi.logger.error("Session Bus queued prompt admission failed", { messageId: message.messageId, error: reason });
+        if (book === capturedBook && queuedPrompts === capturedQueue) notice(`Peer prompt admission failed: ${reason}`, current, "error");
+      });
     } else {
+      if (message.kind === "close") queuedPrompts.cancelConversation(message.conversationId);
       pi.appendEntry("session-bus-final-delivery", message);
       const content = message.kind === "reply"
         ? [
@@ -155,6 +183,7 @@ export default function sessionBus(pi: ExtensionAPI): void {
   async function stopAll(reason: string): Promise<void> {
     if (!peer || !book) return;
     const messages = book.closeAll(reason);
+    queuedPrompts?.cancelAll();
     const sender = peer;
     await Promise.allSettled(messages.map(message => sender.send(message)));
     refresh();
@@ -179,6 +208,8 @@ export default function sessionBus(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async (_event, ctx) => {
     if (ctx.agent.kind !== "main") return;
     shuttingDown = true;
+    queuedPrompts?.dispose();
+    queuedPrompts = undefined;
     const sender = peer;
     const closing = book?.closeAll("The peer terminal is shutting down") ?? [];
     // Shutdown handlers have a two-second deadline. Withdraw even if a peer does not acknowledge.
@@ -210,6 +241,8 @@ export default function sessionBus(pi: ExtensionAPI): void {
   async function replyToMessage(replyTo: string, text: string, done: boolean | undefined, ctx: ExtensionContext) {
     const runtime = requireRuntime(ctx);
     const message = runtime.book.reply(replyTo, text, done);
+    runtime.queuedPrompts.cancelMessage(replyTo);
+    if (message.finished) runtime.queuedPrompts.cancelConversation(message.conversationId);
     const receipt = await deliver(message, runtime);
     return { conversationId: message.conversationId, messageId: message.messageId, turn: message.turn, finished: message.finished, receipt };
   }
@@ -219,6 +252,8 @@ export default function sessionBus(pi: ExtensionAPI): void {
     const messages = target === "all"
       ? runtime.book.closeAll(reason ?? "Stopped by this session")
       : [runtime.book.stop(target, reason)].filter((message): message is AgentMessage => message !== null);
+    if (target === "all") runtime.queuedPrompts.cancelAll();
+    else runtime.queuedPrompts.cancelConversation(target);
     const results = await Promise.allSettled(messages.map(message => deliver(message, runtime)));
     const receipts: MessageReceipt[] = [];
     const failures: string[] = [];

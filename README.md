@@ -2,7 +2,7 @@
 
 Project-scoped local messaging between **independent top-level omp sessions in separate terminals**. Subagent messaging (`task`, `agent://`, IRC, and Agent Hub) is unchanged. No server, credentials, TCP listener, or remote service is required.
 
-Version 2.0.0 uses omp's standard `registerTool`/`registerCommand` extension API and native secure IPC. The host peer dependencies are pinned to the tested **omp 18.17.0** versions; other host versions are not claimed compatible.
+Version 2.0.1 uses omp's standard `registerTool`/`registerCommand` extension API and native secure IPC. The host peer dependencies are pinned to the tested **omp 18.17.0** versions; other host versions are not claimed compatible.
 
 ## Prerequisites and installation
 
@@ -117,6 +117,8 @@ In a non-Git directory, an explicit ancestor root groups its descendants. Unset 
 - The default budget is **8 substantive replies across both participants**, not 8 each. The allowed range is **1–64**. The last allowed response is terminal; models can finish earlier with `done: true`. Local result-processing turns and model API calls do not count as peer replies.
 - Normal tool approval policies, costs, and interruption controls still apply. Peer input is attributed input, not privileged instructions, and must not override the receiver's user or system instructions. The extension does not bypass approvals or authorize a peer to act for the user.
 - Session replacement/rewind cancels old conversations. Restarted runtimes get new random addresses; persisted transcript IDs are descriptive, not routable.
+- `session_list` is a read-only snapshot, not a second delivery channel. If an exact pending ID is answered through `session_reply` before automatic delivery, its still-queued actionable notification is withdrawn. Closing/stopping/failing a conversation also cancels its queued reply-required notifications; previously delivered history remains available and is not replayed as new work.
+- Reply-required notifications use the pinned host's queue-only custom-message admission callback and before-dequeue guard. This preserves custom metadata and agent attribution while rechecking state after asynchronous preprocessing. The plugin needs its owning concrete local omp session; an unsupported remote/custom SDK session handle fails initialization rather than falling back to unsafe uncancellable delivery.
 
 ## Transport and trust
 
@@ -148,10 +150,16 @@ The source retains deterministic tests for project grouping, real Git worktrees/
 
 Credential-free CI runs frozen installation, TypeScript checking, and tests on Windows, Ubuntu, and macOS using Bun 1.4.4. CI does not publish packages or invoke authenticated model providers. A configured matrix is not evidence that a run has passed.
 
-Observed verification of this 2.0.0 checkout with omp 18.17.0 and Bun 1.4.4:
+Initial 2.0.0 verification with omp 18.17.0 and Bun 1.4.4 (historical baseline):
 
 - Windows x64: TypeScript checking passed; 61 tests passed, 5 POSIX-only tests skipped, 0 failed (578 assertions). Two actual omp processes executed all five model tools and exercised all five user commands, including manual and model formal replies, automatic final-result processing, and non-waking cancellation. The renamed user-level plugin auto-loaded in the real TUI.
 - Linux x64/glibc: TypeScript checking and all 66 tests passed, 0 failed (636 assertions), in a private Linux container filesystem. Coverage includes real Unix socket delivery, permissions/ownership, unsafe-root and publication rejection, Unicode/long socket paths, subprocess shutdown, and project isolation. Two actual omp CLI processes also exposed all five model schemas and user commands and discovered one another without model credentials or API calls.
-- macOS: the native library supports Darwin x64/arm64, the implementation uses the same POSIX APIs, and CI includes `macos-latest`. **No macOS runtime or CI run was available here; macOS execution remains unverified.** Windows/Linux evidence is not a claim of macOS execution.
+- macOS: no local macOS host was available. The subsequent [baseline GitHub CI run](https://github.com/zemlinzh/omp-session-bus/actions/runs/42271189543) completed successfully on macOS, Windows, and Ubuntu for commit `29d5e37`. This is baseline test evidence, not a claim of macOS real-model execution or passing 2.0.1 CI.
 
 The Linux verification used a cached Debian-based Node image and the official Bun 1.4.4 npm binary because Docker Hub was inaccessible. Published native Linux dependencies were installed for Linux, not copied from Windows. The source package is portable; platform binaries are supplied by the pinned host dependencies.
+
+### 2.0.1 queued-notification regressions
+
+Local Windows verification: TypeScript checking passed; 83 tests passed, 5 POSIX-only tests skipped, 0 failed (1,253 assertions across four files). New coverage includes two manually consumed threads across 20 rounds, cancellation before/after admission, restored objects, lifecycle replacement, unrelated user-input recovery in both queues, and continuously visible retained user steering.
+
+The native 2.0.0 mechanism was reproduced in two independent three-session runs: both conversations were closed and pending was empty, but four handled notifications remained queued and were later presented again. The patch withdraws still-pending/claimed notifications, not already committed model input or retained history. Restart all participating terminals after updating; loaded 2.0.0 handlers and their existing queues are not hot-patched.
