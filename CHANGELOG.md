@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.1.0
+
+### Fixed
+
+- Replace per-message request and final-reply model wakeups with one owned inbox marker. The current unread backlog is claimed as a stable receive-sequence batch; arrivals during processing form the next batch.
+- Add `session_inbox` read/complete with exact batch IDs, bounded complete-body pages, and completion guards for unread pages or unanswered requests. Expose unread/final-result state separately from conversation pending replies.
+- Preserve every original correlation envelope and final result. Batch guidance reconciles business revisions before actions; it never treats arrival order as version order or silently deduplicates similar topics.
+- Keep cancellation and manual consumption bound to the exact marker, without changing host follow-up modes, user input, recovery objects or delivered history. Wake-admission failures retain readable messages and report an explicit recovery path, not a retry loop.
+- Preserve optional inbox IDs and offsets in model-facing schemas through a tool-local strict-mode opt-out; keep exact batch, page and pending-reply guards unchanged.
+
+Existing terminals retain old handlers and notifications until restarted. This release is not a hot patch or cross-restart mailbox; finish or record outstanding work before restarting both peers.
+
 ## 2.0.1
 
 ### Fixed

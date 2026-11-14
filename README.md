@@ -2,7 +2,7 @@
 
 Project-scoped local messaging between **independent top-level omp sessions in separate terminals**. Subagent messaging (`task`, `agent://`, IRC, and Agent Hub) is unchanged. No server, credentials, TCP listener, or remote service is required.
 
-Version 2.0.1 uses omp's standard `registerTool`/`registerCommand` extension API and native secure IPC. The host peer dependencies are pinned to the tested **omp 18.17.0** versions; other host versions are not claimed compatible.
+Version 2.1.0 uses omp's standard extension API and native secure IPC. Dependencies remain pinned to **omp 18.17.0**; additional host verification is reported separately, not inferred from installation.
 
 ## Prerequisites and installation
 
@@ -60,7 +60,7 @@ omp plugin uninstall omp-session-bus
 /session-send <B-session-id> --turns 4 Compare the alternatives and return your final recommendation.
 ```
 
-The receiving runtime acknowledges acceptance. Its model explicitly sends a substantive response with `session_reply`. Formal responses automatically reach the sender for processing, **including a final response after the sender has become idle**. No human forwarding, receive tool, or built-in `wait` call is needed. Ordinary assistant text is not blindly forwarded: exact reply correlation keeps unrelated user work and concurrent conversations separate.
+The receiving runtime acknowledges acceptance. One notification wakes the recipient for all unread requests and formal results, including final replies. The model reads the stable `session_inbox` batch, handles each exact pending request through `session_reply`, then completes the batch. No human forwarding or built-in `wait` is needed. Ordinary assistant text is not forwarded: exact reply correlation keeps unrelated user work and conversations separate.
 
 ## Commands and tools
 
@@ -68,6 +68,7 @@ The receiving runtime acknowledges acceptance. Its model explicitly sends a subs
 | --- | --- |
 | `/session-id` | Show this live main session's address. |
 | `/session-list` | Show the project, reachable main sessions, status, working directories, and local conversations. |
+| `/session-inbox` | Inspect unread/active-batch state without consuming messages or starting a model. |
 | `/session-send <id> [--turns N] <text>` | Start a conversation; report runtime acceptance and its conversation ID. |
 | `/session-reply <message-id> [--done] <text>` | Send a correlated formal response; `--done` ends dialogue after delivery. |
 | `/session-stop <conversation-id\|all> [reason]` | Cancel one or all local conversations without requesting a model turn. |
@@ -75,12 +76,16 @@ The receiving runtime acknowledges acceptance. Its model explicitly sends a subs
 | Model tool | Behavior |
 | --- | --- |
 | `session_identity({})` | Return the live main session's identity and project. |
-| `session_list({})` | Return self, same-project peers, conversations, and messages needing formal replies. |
-| `session_send({to, text, maxTurns?})` | Start a new same-project conversation. An ACK is not the formal answer. |
-| `session_reply({replyTo, text, done?})` | Answer an exact pending message; `done: true` still wakes the recipient to process the final result. |
+| `session_list({})` | Return self, peers, conversations, formal pending replies and separate inbox status. |
+| `session_inbox({action:"read", batchId?, offset?})` | Claim/read the stable current batch; follow `nextOffset` with its exact `batchId` until all pages are read. |
+| `session_inbox({action:"complete", batchId})` | Finish that batch only after every page is read and every still-pending request is replied to or cancelled. |
+| `session_send({to, text, maxTurns?})` | Start a new same-project conversation. Do not create reminder conversations for an existing unresolved work item. |
+| `session_reply({replyTo, text, done?})` | Answer an exact pending message; `done:true` places the final result in the recipient's batch inbox. |
 | `session_stop({conversationId, reason?})` | Send terminal cancellation. |
 
 These tools are excluded from child runtimes. Ordinary subagents and depth-zero `/tan` children publish no address and never enter the cross-session roster. `/agents` remains omp's built-in agent-definition manager.
+
+For the first inbox read, omit `batchId` and `offset`: `session_inbox({action:"read"})`. An empty ID or `null` is not omission. Later pages use the exact returned `batchId` and `nextOffset`; completion takes the exact `batchId` and no `offset`. This tool opts out of structured-output strict rewriting so OpenAI-family hosts retain optional fields instead of requiring placeholder arguments. Runtime batch, page and pending-reply checks remain unchanged.
 
 ## Project isolation
 
@@ -111,14 +116,30 @@ In a non-Git directory, an explicit ancestor root groups its descendants. Unset 
 ## Delivery, approval, and termination
 
 - ACK means the runtime accepted input, not that its model read or completed it.
-- Requests and every substantive formal reply use supported follow-up delivery. Idle receivers start a processing turn; busy receivers queue a continuation behind existing work, without forcibly interrupting a tool or requiring another human prompt.
-- ACK and cancellation schedule no model turns. `done=true` ends peer dialogue, **not local final-result processing**. The final recipient processes/reports the result without another peer response.
+- Requests and substantive replies, including closed final results, enter one inbox. At most one owned wake marker waits in the host queue. Busy work is not interrupted; no global follow-up mode or grouping changes are made.
+- Read all pages before deciding actions. Each entry preserves its original envelope and local receive sequence; arrivals after the batch high-water mark belong to the next batch. The active batch is stable on repeat reads. Completion schedules at most one next wake. No new wake is generated merely because a model stopped before completing a batch; inspect/read that active batch to resume.
+- ACK and cancellation schedule no model turns. `done=true` closes dialogue, not unread-result handling. Closed results need no peer acknowledgment, routine per-message user report, reopened conversation or repeated business action.
 - Responses require correlated project, conversation, message, sender, receiver, consecutive turn, and immutable budget fields. Concurrent conversations cannot consume one another's replies.
 - The default budget is **8 substantive replies across both participants**, not 8 each. The allowed range is **1–64**. The last allowed response is terminal; models can finish earlier with `done: true`. Local result-processing turns and model API calls do not count as peer replies.
 - Normal tool approval policies, costs, and interruption controls still apply. Peer input is attributed input, not privileged instructions, and must not override the receiver's user or system instructions. The extension does not bypass approvals or authorize a peer to act for the user.
 - Session replacement/rewind cancels old conversations. Restarted runtimes get new random addresses; persisted transcript IDs are descriptive, not routable.
-- `session_list` is a read-only snapshot, not a second delivery channel. If an exact pending ID is answered through `session_reply` before automatic delivery, its still-queued actionable notification is withdrawn. Closing/stopping/failing a conversation also cancels its queued reply-required notifications; previously delivered history remains available and is not replayed as new work.
-- Reply-required notifications use the pinned host's queue-only custom-message admission callback and before-dequeue guard. This preserves custom metadata and agent attribution while rechecking state after asynchronous preprocessing. The plugin needs its owning concrete local omp session; an unsupported remote/custom SDK session handle fails initialization rather than falling back to unsafe uncancellable delivery.
+- `session_list.pending` only counts formal replies still owed. `inbox.unread` and `inbox.activeBatch` also cover final results. Listing is read-only; `session_inbox` explicitly claims and completes a batch. Manual replies and cancellation retire obsolete requests, never unread final results just because their conversation is closed.
+- The inbox's single wake marker uses the existing queue-only admission callback and before-dequeue cancellation guard. User steering/follow-ups and abort-recovery identities remain untouched. A concrete local owning session is required; unsupported host handles fail initialization.
+- An inbox holds at most 256 entries. Pages contain at most 32 entries and 1 MiB of encoded JSON, retaining complete messages without truncation. Overload rejects before advancing conversation state; duplicate replay and cancellation still work. Wake admission errors keep messages readable through `session_inbox` and do not automatically retry.
+- Arrival sequence is not business revision. Compare explicit work item/object/candidate/operation identities and current evidence across conversations; no latest-arrival-wins or text-similarity deduplication is performed. A completed batch acknowledges handling, not exactly-once execution of arbitrary business effects. Preserve operation receipts and uncertainty on interruption.
+
+### Upgrade and recovery
+
+Version 2.1.0 needs both peers restarted after their installed source link is updated. Already-running windows keep the old handler and old queued text; the new inbox does not retroactively claim those notifications. Before restarting, finish or record pending work and stop sending reminders for closed work. Do not clear all host queues: user input and abort recovery are separate. After restarting, obtain new live addresses with `/session-list`.
+
+If an inbox wake was interrupted, `/session-inbox` shows the outstanding batch. Resume with `session_inbox({action:"read"})`, read every returned page, answer/cancel exact pending requests, then complete the returned batch ID. Terminal results are consumed only by completion, not by their conversation closing. Cross-restart mailbox recovery and automatic business-state supersession are not implemented.
+
+### Batch verification
+
+Windows with the pinned 18.17.0 SDK: type checking passed; 123 tests passed, 5 POSIX-only skips, 0 failures. After the review's compact-serialization correction, type checking and the actual IPC/tool serialization test passed separately. Installed 18.20.0 SDK: 88 queue/inbox/conversation/IPC tests and type checking passed. These are distinct runs, not a new whole-suite result on every version.
+
+An isolated compiled omp 18.20.0 CLI run used a deterministic local provider (no remote model call), actual extension registration, AgentSession, native IPC and real model tool execution. Twenty final results plus one request produced one inbox wake and one batch, consumed all 21 original envelopes, returned the exact correlated reply and left zero unread entries. The fixture's early incomplete runs are not counted as passing. This verifies the runtime mechanism, not arbitrary model obedience or business-effect exactly-once behavior. Linux/macOS were not rerun for this release.
+
 
 ## Transport and trust
 

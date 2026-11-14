@@ -73,6 +73,29 @@ function state(book: ConversationBook, conversationId: string) {
   return book.list().find(conversation => conversation.conversationId === conversationId);
 }
 
+describe("inbox capacity admission preserves conversation correlation", () => {
+  test("rejection cannot advance a request or final reply; duplicates and close bypass admission", () => {
+    const a = new ConversationBook(A, PROJECT_A);
+    const b = new ConversationBook(B, PROJECT_A);
+    const request = a.start(B, "Request retained across capacity refusal");
+    const reject = () => { throw new Error("Inbox full"); };
+    expect(() => b.receive(request, reject)).toThrow("Inbox full");
+    expect(b.list()).toEqual([]);
+    expect(b.pending()).toEqual([]);
+    expect(b.receive(request)).toBe("request");
+    expect(b.receive(request, reject)).toBe("duplicate");
+    const final = b.reply(request.messageId, "Complete result must remain readable", true);
+    expect(() => a.receive(final, reject)).toThrow("Inbox full");
+    expect(state(a, request.conversationId)?.status).toBe("awaiting-reply");
+    expect(a.receive(final)).toBe("terminal");
+    expect(a.receive(final, reject)).toBe("duplicate");
+    const next = a.start(B, "Cancellation remains possible during overload");
+    b.receive(next);
+    expect(b.receive(a.stop(next.conversationId)!, reject)).toBe("terminal");
+    expect(b.pending()).toEqual([]);
+  });
+});
+
 describe("ConversationBook alternating formal replies", () => {
   test("completes two-party dialogue exactly at its shared finite turn limit", () => {
     const a = new ConversationBook(A, PROJECT_A);

@@ -86,7 +86,7 @@ export class ConversationBook {
     return message;
   }
 
-  receive(message: AgentMessage): "request" | "terminal" | "duplicate" {
+  receive(message: AgentMessage, beforeAccept?: () => void): "request" | "terminal" | "duplicate" {
     validateMessage(message);
     if (message.to !== this.agentId) throw new Error("Message is addressed to another agent");
     if (message.projectId !== this.projectId) throw new Error("Message belongs to another project");
@@ -104,6 +104,7 @@ export class ConversationBook {
       if (conversation) throw new Error("Conversation already exists or is closed");
       this.requireConversationCapacity();
       this.requirePendingCapacity();
+      beforeAccept?.();
       const incoming = this.addConversation(message, "needs-reply", message.from);
       this.record(incoming, message);
       this.pendingMessages.set(message.messageId, { ...message });
@@ -133,6 +134,7 @@ export class ConversationBook {
     if (message.inReplyTo !== conversation.lastMessageId) throw new Error("Reply correlation does not match the last outgoing message");
     if (message.turn !== conversation.turn + 1) throw new Error("Reply turn is not consecutive");
     if (!message.finished) this.requirePendingCapacity();
+    beforeAccept?.();
 
     this.record(conversation, message);
     conversation.lastMessageId = message.messageId;
